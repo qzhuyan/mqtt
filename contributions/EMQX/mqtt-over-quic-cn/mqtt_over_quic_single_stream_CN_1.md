@@ -86,6 +86,7 @@ License, Document Status and Notices.
 - [3 Document Conventions](#3-document-conventions)
   - [3.1 Key Words](#31-key-words)
   - [3.2 Typographical Conventions](#32-typographical-conventions)
+  - [3.3 Relationship to QUIC Specifications](#33-relationship-to-quic-specifications)
 - [4 Introduction](#4-introduction)
   - [4.1 Motivation](#41-motivation)
   - [4.2 Changes From the Previous Version](#42-changes-from-the-previous-version)
@@ -101,9 +102,10 @@ License, Document Status and Notices.
 - [6 Connection Management](#6-connection-management)
   - [6.1 Establishing a Connection](#61-establishing-a-connection)
   - [6.2 Connection Keepalive](#62-connection-keepalive)
-  - [6.3 Connection Termination](#63-connection-termination)
+  - [6.3 Stream and Connection Termination](#63-stream-and-connection-termination)
     - [6.3.1 Graceful Shutdown](#631-graceful-shutdown)
     - [6.3.2 Abnormal Shutdown](#632-abnormal-shutdown)
+    - [6.3.3 QUIC Error Code Semantics](#633-quic-error-code-semantics)
   - [6.4 Protocol Discovery](#64-protocol-discovery)
     - [6.4.1 DNS-Based Endpoint Resolution](#641-dns-based-endpoint-resolution)
     - [6.4.2 QUIC Capability Probe](#642-quic-capability-probe)
@@ -117,6 +119,14 @@ License, Document Status and Notices.
     - [6.6.3 Post-Session Fallback](#663-post-session-fallback)
     - [6.6.4 Preventing Reconnection Livelock](#664-preventing-reconnection-livelock)
   - [6.7 Error Mapping and State Synchronization](#67-error-mapping-and-state-synchronization)
+    - [6.7.1 Mapping QUIC Transport Errors to MQTT Session State](#671-mapping-quic-transport-errors-to-mqtt-session-state)
+      - [6.7.1.1 Abnormal Transport Shutdown](#6711-abnormal-transport-shutdown)
+    - [6.7.2 Mapping MQTT Protocol Errors to QUIC Transport State](#672-mapping-mqtt-protocol-errors-to-quic-transport-state)
+      - [6.7.2.1 Protocol Violations and Malformed Packets (MQTT 5.0)](#6721-protocol-violations-and-malformed-packets-mqtt-50)
+      - [6.7.2.2 Protocol Violations and Malformed Packets (MQTT 3.1.1)](#6722-protocol-violations-and-malformed-packets-mqtt-311)
+      - [6.7.2.3 Error-Stream Completion and Cleanup](#6723-error-stream-completion-and-cleanup)
+    - [6.7.3 Error Mapping Matrix](#673-error-mapping-matrix)
+    - [6.7.4 State Synchronization Summary](#674-state-synchronization-summary)
   - [6.8 Keepalive Strategy](#68-keepalive-strategy)
     - [6.8.1 Connection Migration](#681-connection-migration)
 - [7 Security Considerations](#7-security-considerations)
@@ -164,9 +174,10 @@ This document uses the following terms as defined in external standards:
 
 - **connection:** A transport-layer connection between two endpoints using QUIC
   as the transport protocol. [RFC9000]
-- **stream:** A QUIC stream as defined in [RFC9000]. QUIC streams provide
-  reliable, in-order delivery of bytes. Streams can be unidirectional or
-  bidirectional, and can be initiated by either endpoint.
+- **stream:** A QUIC stream as defined in [RFC9000] §2.
+- **FIN:** A flag in a QUIC STREAM frame indicating the end of the sender's
+  stream direction. FIN is not a separate frame or an MQTT packet. It does not
+  close the opposite direction or the QUIC connection. [RFC9000] §19.8.
 - **session:** An MQTT session as defined in [MQTT5] §4.1. For MQTT 3.1.1, the equivalent concept is the session defined in [MQTT311] §1.2 (Session), where session persistence is controlled by the Clean Session flag rather than a Session Expiry Interval.
 - **MQTT packet:** An MQTT control packet as defined in [MQTT5] §2. For MQTT 3.1.1, the equivalent is an MQTT Control Packet as defined in [MQTT311] §3.
 
@@ -217,40 +228,25 @@ QUIC frame type names are written in all capitals, for example
 `CONNECTION_CLOSE` and `RESET_STREAM`, following the convention used in
 [RFC9000].
 
+## 3.3 Relationship to QUIC Specifications
+
+Implementations MUST conform to [RFC9000] and [RFC9001]. This document defines
+the MQTT-to-QUIC mapping and additional application requirements; it does not
+redefine QUIC frame processing, stream states, flow control, loss recovery,
+connection migration, or transport termination. Those mechanisms follow the
+referenced QUIC specifications.
+
 ---
 
 # 4 Introduction
 
 ## 4.1 Motivation
 
-QUIC is the transport protocol underlying HTTP/3, standardised by the IETF in
-[RFC9000]. It was designed to address well-known limitations of TCP, making it
-an attractive replacement transport for MQTT deployments in modern mobile and
-constrained-network environments.
-
-The Single Stream mode is the simplest way to bring these connection-level
-benefits to MQTT. By replacing the TCP/TLS connection with a QUIC connection and
-routing all MQTT traffic through one bidirectional stream, implementations gain
-the following advantages with minimal changes to existing code.
-
-**Faster connection establishment.** QUIC completes its cryptographic handshake
-in one round trip (1-RTT), compared to the multiple round trips required by
-TCP+TLS. After a prior connection, QUIC can resume in zero round trips (0-RTT),
-allowing MQTT clients to send data before the server has responded — beneficial
-for devices operating on high-latency networks.
-
-**Robustness to network changes.** QUIC's connection migration feature allows
-an endpoint to change its IP address or port without losing the connection. MQTT
-clients that roam between Wi-Fi and cellular networks can remain connected
-through the network change without disconnecting and reconnecting.
-
-**Embedded security.** QUIC mandates TLS 1.3 for all connections by default.
-There is no plain-text QUIC option. This eliminates the need for a separate TLS
-negotiation step and ensures that all MQTT traffic is encrypted in transit.
-
-**Pluggable congestion control.** QUIC's congestion control algorithm is
-implemented in user space and can be tailored to the requirements of a specific
-deployment, without changes to the kernel network stack.
+Single Stream mode lets MQTT deployments use QUIC without changing MQTT
+packet formats. It targets deployments that benefit from QUIC connection
+establishment [RFC9000] §7, TLS-based security [RFC9001], and connection
+migration [RFC9000] §9. The MQTT-specific conditions for 0-RTT and migration
+are defined in Sections 5.5.3 and 6.8.1, respectively.
 
 ## 4.2 Changes From the Previous Version
 
@@ -293,19 +289,10 @@ bidirectional stream in the order they are produced. No changes are made to the
 MQTT packet binary format. This mode is fully compatible with MQTT 3.1.1
 [MQTT311] and MQTT 5.0 [MQTT5].
 
-QUIC delivers data as an ordered byte stream and does not preserve packet
-boundaries: a single MQTT packet may span multiple QUIC STREAM frames, or
-multiple MQTT packets may arrive in a single STREAM frame [RFC9000]. Endpoints
-MUST reassemble MQTT packets from the QUIC byte stream according to the MQTT
-remaining length field [MQTT5] §2.1.4, exactly as they would when receiving
-data over TCP.
-
-QUIC provides both stream-level flow control (`MAX_STREAM_DATA` frames) and
-connection-level flow control (`MAX_DATA` frames) [RFC9000] §4.2. In Single
-Stream mode, the connection-level credit (advertised via `MAX_DATA` frames)
-provides the effective upper bound on total buffered data. Connection-level
-flow control is handled transparently by the QUIC library and does not require
-application-layer intervention.
+Endpoints MUST reassemble MQTT packets from the QUIC byte stream using the
+MQTT Remaining Length field [MQTT5] §2.1.4, not QUIC STREAM frame boundaries
+[RFC9000] §2.2. This profile does not modify QUIC stream or connection flow
+control [RFC9000] §4.
 
 Because there is only one stream, MQTT traffic in this mode retains the same
 head-of-line blocking characteristics as TCP-based transport: a large PUBLISH
@@ -335,19 +322,18 @@ Table I
 | Co-existence with other protocols |      No       |         No          |         Yes          |
 | Number of concurrent streams      |       1       |        1..n         |         1..n         |
 | Broker-initiated stream           |      No       |         No          |         Yes          |
-| Per-stream flow control           |      No       |         Yes         |         Yes          |
+| QUIC per-stream flow control      |      Yes      |         Yes         |         Yes          |
 | Per-stream prioritization         |      No       |         Yes         |         Yes          |
 | Persistent sessions               |      Yes      | Control stream only |         Yes          |
 | HOLB mitigation                   |      No       |         Yes         |         Yes          |
-| Send/receive abort                |      No       |         Yes         |         Yes          |
+| Send/receive abort                |      Yes      |         Yes         |         Yes          |
 | Trackable flows                   |      No       |         No          |         Yes          |
 
 ## 5.5 ALPN Negotiation
 
-The Application-Layer Protocol Negotiation (ALPN) extension [RFC7301] is the
-sole mechanism for identifying Single Stream mode during the QUIC handshake.
-QUIC uses the ALPN extension as defined in [RFC9001] §8.1 to negotiate the
-application-layer protocol before any application data is exchanged.
+Single Stream mode is identified solely by the ALPN identifier `mqtt`
+[RFC7301], [RFC9001] §8.1. MQTT exchange is subject to the negotiation and
+0-RTT requirements in Section 5.5.3.
 
 ### 5.5.1 Client ALPN Offer
 
@@ -362,10 +348,8 @@ Single Stream mode for the connection.
 
 ### 5.5.2 Server ALPN Selection
 
-In ALPN, the server selects exactly one protocol from the list offered by the
-client, or fails the handshake; the server cannot select an identifier that
-the client did not offer [RFC7301]. When a client's offer includes `mqtt`,
-the server MUST respond as follows:
+ALPN selection follows [RFC7301]. When a client's offer includes `mqtt`, the
+server MUST respond as follows:
 
 1. If the server supports Single Stream mode, the server SHOULD select the
    `mqtt` identifier, unless the client's offer contains another mutually
@@ -447,31 +431,26 @@ The following table summarizes the client-side processing rules. Note that MQTT 
 | 0 | 0x00 | New/clean session started (Clean Start=1 or no prior state found). | New/clean session started (CleanSession=1 or no prior state found). |
 | 0 | ≥ 0x80 | Connection refused. Server **MUST close Network Connection** [MQTT-3.2.2-7]. Client **MUST discard session state** [MQTT-3.2.2-4]. | Not applicable. MQTT 3.1.1 CONNACK RC values are limited to 0x00–0x05; values ≥ 0x80 are invalid and would be treated as a protocol violation. |
 | 0 | 0x01–0x7F (non-zero < 0x80) | Not used for CONNACK (non-zero RC < 0x80 does not appear in CONNACK; such values exist in other packet types like SUBACK). | Not applicable. MQTT 3.1.1 CONNACK RC values are limited to 0x00–0x05. |
-| 0 | 0x01–0x05 (non-zero) | Not applicable. MQTT 5.0 CONNACK only uses RC 0x00 or ≥ 0x80. | Connection refused with specific reason (e.g., 0x01 Unacceptable Protocol Version, 0x02 Identifier Rejected, etc.). Server **MUST close Network Connection** [MQTT-3.2.2-5]. Client **MUST discard session state** [MQTT-3.2.2-4]. |
+| 0 | 0x01–0x05 (non-zero) | Not applicable. MQTT 5.0 CONNACK only uses RC 0x00 or ≥ 0x80. | Connection refused with specific reason (e.g., 0x01 Unacceptable Protocol Version, 0x02 Identifier Rejected, etc.). Server **MUST close Network Connection** [MQTT-3.2.2-5]. Session Present **MUST be 0** [MQTT-3.2.2-4]; refusal does not itself require deletion of previously stored Session State. |
 | 1 | non-zero | **Invalid.** Server **MUST** set Session Present to 0 when Reason Code is non-zero [MQTT-3.2.2-6]. | **Invalid.** Server **MUST** set Session Present to 0 when Reason Code is non-zero [MQTT-3.2.2-4]. |
 
 ## 6.2 Connection Keepalive
 
-Connection keepalive in Single Stream mode is performed at the QUIC transport
-layer. QUIC defines the PING frame [RFC9000] §19.2 for connection keepalive,
-which can be used to keep a connection alive and detect unacked endpoints
-without sending application data. During idle periods, implementations SHOULD
-send ack-eliciting PING frames to prevent the connection from timing out due
-to inactivity.
+Both endpoints SHOULD use native QUIC connection keepalive and send QUIC PING
+frames during idle periods. Idle-timeout calculation and keepalive operation
+follow [RFC9000] §10.1, including the middlebox guidance in §10.1.2; the PING
+frame is defined in §19.2.
 
-The effective idle timeout is the minimum of the `max_idle_timeout` values
-advertised by both endpoints [RFC9000] §18.2, with a minimum floor of 3× PTO
-per [RFC9000] §10.1. Middleboxes (proxies, NAT gateways, load balancers) may
-time out UDP state earlier than the negotiated idle timeout. RFC 9000 §10.1.2
-recommends sending packets at least every 30 seconds to prevent middleboxes from
-losing state for UDP flows.
-
-MQTT-level keepalive via `MQTT.PINGREQ` and `MQTT.PINGRESP` MAY still be used
-alongside QUIC keepalive. However, if a QUIC connection is configured with an idle
-timeout, that timeout SHOULD be set to a value greater than the MQTT keepalive
-value to avoid conflict.
+MQTT-level keepalive via `MQTT.PINGREQ` and `MQTT.PINGRESP` MAY be used alongside
+QUIC keepalive for application-level liveness detection. It MUST NOT be used
+as a substitute for QUIC connection keepalive. If a QUIC idle timeout is
+configured, it SHOULD be greater than the MQTT Keep Alive interval.
 
 ## 6.3 Stream and Connection Termination
+
+Stream closure is determined under [RFC9000] §3.4, and QUIC connection
+termination follows [RFC9000] §10. The following rules specify the MQTT
+actions that initiate these transport operations.
 
 ### 6.3.1 Graceful Shutdown
 
@@ -479,10 +458,6 @@ In Single Stream mode, graceful shutdown closes the **stream** (not the entire
 QUIC connection). The stream is the transport channel for MQTT — closing it
 signals that the MQTT session is complete on that channel. The QUIC connection
 itself remains open so the client can reconnect on the same transport.
-
-QUIC does not define a protocol-level graceful shutdown mechanism. In Single
-Stream mode, graceful disconnection is handled at the MQTT layer before the
-stream is half-closed.
 
 Graceful shutdown MAY be used by a broker to redirect the client to another
 server or to prevent transmission of the client's Will message. A client MAY
@@ -498,8 +473,7 @@ QUIC, this corresponds to a normal stream half-close (no error).
    DISCONNECT packet has no variable header [MQTT311] §3.14.1).
 2. After sending `MQTT.DISCONNECT`, the client half-closes its send direction
    on the stream. The peer SHOULD respond with its own `MQTT.DISCONNECT` and
-   half-close its send direction in turn. The stream is fully closed when both
-   directions are half-closed.
+   half-close its send direction in turn.
 3. Any MQTT packets received from the broker before the stream is fully closed
    SHOULD be properly handled.
 4. The client MUST NOT send any further MQTT packets after sending
@@ -511,17 +485,16 @@ QUIC, this corresponds to a normal stream half-close (no error).
 6. If the client receives a QUIC `CONNECTION_CLOSE` frame before the stream
    shutdown completes, the graceful shutdown procedure has failed.
 7. The client MUST enforce a graceful shutdown timeout (RECOMMENDED: 10 seconds).
-   If the peer does not respond with a normal stream close (both directions
-   half-closed) within this timeout, the client MUST abort the stream using
-   `RESET_STREAM` and close the connection. This prevents lingering half-closed
+   If the peer does not complete normal stream closure within this timeout,
+   the client MUST abort the stream using `RESET_STREAM` and close the
+   connection. This prevents lingering half-closed
    stream resources when the peer fails to complete the graceful shutdown.
 
 **Server-initiated graceful shutdown:**
 
 For MQTT 5.0, the server MAY send `MQTT.DISCONNECT` with a Reason Code to
 gracefully close the stream. The server then half-closes its send direction
-on the stream. The QUIC stream is fully closed when both directions are
-half-closed. For MQTT 3.1.1, the broker MUST NOT send `MQTT.DISCONNECT` — the
+on the stream. For MQTT 3.1.1, the broker MUST NOT send `MQTT.DISCONNECT` — the
 3.1.1 specification defines DISCONNECT as a client-to-server-only packet
 [MQTT311] §3.14. In this case the broker half-closes its send direction on the
 stream without sending any MQTT packet.
@@ -542,88 +515,90 @@ distinguishes it from a network failure by the absence of any error indicator.
 
 ### 6.3.2 Abnormal Shutdown
 
-Abnormal shutdown is any connection termination that does not follow the
-graceful shutdown procedure. It does not require cooperation from the peer. The
-following conditions can trigger abnormal shutdown:
+Abnormal shutdown is termination that does not follow Section 6.3.1, including
+stream abort, connection timeout, immediate connection closure, or an
+unrecoverable transport failure. Stopping MQTT processing and initiating
+shutdown MUST NOT depend on a graceful close from the peer.
 
-- The stream is aborted before the graceful shutdown procedure completes.
-- An immediate connection shutdown is triggered locally by the application.
-- An immediate connection shutdown is triggered remotely by the peer before the
-  graceful shutdown procedure completes.
-- The connection becomes idle and times out.
-- An unrecoverable transport error occurs, such as a device failure, operating
-  system failure, or an unhandled network change.
+Either endpoint applies the following MQTT-to-QUIC mapping:
 
-When the broker initiates an abnormal shutdown, it uses one of two QUIC-level
-mechanisms depending on who is at fault:
+- **Peer's MQTT error:** For a Malformed Packet or Protocol Error, follow
+  Section 6.7.2: stop incoming MQTT processing, finish the sending direction
+  with FIN, and use `STOP_SENDING` for the receiving direction where applicable.
+- **Local cancellation:** Use `RESET_STREAM` to abort the local sending
+  direction, for example on resource exhaustion. If both directions must be
+  terminated, also abort receiving using `STOP_SENDING` where applicable
+  [RFC9000] §3.5. Server busy and session takeover remain broker-originated
+  reasons.
 
-**STOP_SENDING** (peer's error): The server sends a `STOP_SENDING` frame with
-an error code to indicate that the peer caused the problem. The server will not
-read any more data from the stream. This is used when the client sent a malformed
-packet or committed a protocol violation. The error code in `STOP_SENDING`
-indicates the reason.
-
-**RESET_STREAM** (local error): The server sends a `RESET_STREAM` frame with
-an error code to indicate that the server is initiating the abort for its own
-reasons (e.g., server busy, resource exhaustion, session takeover). The stream
-is immediately cancelled and no more data will be exchanged.
-
-For MQTT 5.0, the `MQTT.DISCONNECT` packet is sent before either mechanism
-(if the session is already established; during the CONNECT phase no DISCONNECT
-is possible). For MQTT 3.1.1, the QUIC-level mechanism serves as the in-band
-substitute for the missing server-to-client `MQTT.DISCONNECT` packet.
+Section 6.3.3 defines error codes and their interpretation. Section 6.7.2
+specifies the permitted MQTT packets and bounded cleanup for protocol errors;
+starting that shutdown MUST NOT wait for their delivery or peer FIN.
 
 ### 6.3.3 QUIC Error Code Semantics
 
-In Single Stream mode, the single QUIC stream carries the entire MQTT session.
-When the broker terminates the MQTT session via an abortive mechanism, it
-includes an application
-error code in the `RESET_STREAM` or `STOP_SENDING` frame to indicate the reason
-for termination. Error codes use the scheme `0x300 + MQTT reason code`, where
-`0x300` is the base offset and the MQTT reason code is added to produce a
-unique QUIC error code:
+In Single Stream mode, one QUIC stream carries each MQTT Network Connection.
+When either endpoint terminates the MQTT Network Connection via an abortive
+mechanism, it includes an application error code in the `RESET_STREAM` or
+`STOP_SENDING` frame to indicate the reason for termination. The cleanup
+fallback in Section 6.7.2.3 also uses this mapping for an application
+`CONNECTION_CLOSE`. The shared rules below apply to both client and broker;
+client reconnection policy is specified separately.
+Error codes use the scheme `0x300 + MQTT reason code`, where `0x300` is the base
+offset and the MQTT reason code is added to produce a unique QUIC error code:
 
-| MQTT reason code | MQTT reason | QUIC error code |
-|:----------------:|:-----------:|:---------------:|
-| `0x81` | Malformed Packet | `0x381` |
-| `0x82` | Protocol Error | `0x382` |
-| `0x8E` | Session Taken Over | `0x38E` |
+| MQTT reason code | MQTT reason | QUIC error code | Reason originator |
+|:----------------:|:-----------:|:---------------:|:------------------|
+| `0x81` | Malformed Packet | `0x381` | Client or broker |
+| `0x82` | Protocol Error | `0x382` | Client or broker |
+| `0x8E` | Session Taken Over | `0x38E` | Broker only |
 
-This is a direct 1:1 mapping — no lookup table is needed. The broker simply
-adds `0x300` to the MQTT reason code to produce the QUIC error code.
+This is a direct 1:1 mapping — no lookup table is needed. The originating
+endpoint adds `0x300` to the MQTT reason code to produce the QUIC error code.
 
-**STOP_SENDING** (peer's error): The client SHOULD inspect the error code to
-determine the reason for termination:
+An endpoint originating a mapped reason MUST respect the sender-role
+restrictions of the corresponding MQTT 5.0 Reason Code [MQTT5] §3.14.2.1 (or
+§3.2.2.2 for a failed CONNECT response). 
 
-- `0x381` (Malformed Packet): The client sent a malformed packet. The client
-  MUST NOT retry on the same transport for this session — the error indicates
-  a protocol violation.
-- `0x382` (Protocol Error): The client committed a protocol violation. The
-  client MUST NOT retry on the same transport for this session.
-- `0x38E` (Session Taken Over): The session was taken over by another connection.
-  The client MUST apply the backoff from Section 6.6.4 before attempting to
-  reconnect.
-- Any other error code: The client SHOULD treat this as a network failure
-  and MAY retry with standard backoff.
+**STOP_SENDING** (request to stop the peer's sending direction): The receiving
+endpoint SHOULD inspect the error code. A peer-originated `0x381` or `0x382`
+reports that the peer detected a Malformed Packet or Protocol Error in data
+sent by the receiving endpoint. This applies equally to a broker reporting a
+client error and a client reporting a broker error. A broker-originated
+`0x38E` reports session takeover; it does not imply that the client sent an
+invalid packet. The frame type alone does not assign fault.
 
-**RESET_STREAM** (local error): For MQTT 3.1.1, these error codes serve as the
-in-band substitute for the missing server-to-client `MQTT.DISCONNECT` packet.
-For MQTT 5.0, they supplement the `MQTT.DISCONNECT` packet with transport-layer
-context. The client SHOULD inspect the error code to determine the reason for
-termination:
+**RESET_STREAM** (cancellation of the frame sender's sending direction): The
+receiving endpoint SHOULD inspect the error code and the shutdown context. A
+locally initiated reset reports a cancellation reason. A reset can instead be
+a response to an earlier `STOP_SENDING`; receiving a reset does not by itself
+identify which endpoint detected an MQTT error or caused it.
 
-- `0x38E` (Session Taken Over): The broker initiated a session takeover. The
-  client MUST apply the backoff from Section 6.6.4 before attempting to
-  reconnect.
-- `0x382` (Protocol Error): The broker detected a protocol error and is
-  aborting the stream. The client SHOULD NOT retry on the same transport for
-  this session.
-- Any other error code: The client SHOULD treat this as a network failure
-  and MAY retry with standard backoff.
+Responses to `STOP_SENDING`, including reset generation and error-code copying,
+follow [RFC9000] §3.5. A copied code in a responding `RESET_STREAM` MUST NOT be
+interpreted as an independent error report or a new session takeover. For
+example, a client can echo a broker's `0x38E` without originating a takeover.
 
-For MQTT 5.0, the error codes supplement the `MQTT.DISCONNECT` packet with
-transport-layer context. The client SHOULD use the DISCONNECT reason code as
-the primary signal and the QUIC error code as a secondary confirmation.
+For MQTT 5.0, when a received `MQTT.DISCONNECT` and a peer-originated QUIC error
+report refer to the same shutdown, either endpoint SHOULD use the DISCONNECT
+Reason Code as the primary signal and the QUIC error code as a secondary
+confirmation. When `MQTT.DISCONNECT` is unavailable, either endpoint
+SHOULD use the available QUIC error code and shutdown context. A solicited
+reset echo is not a new peer-originated report. For MQTT 3.1.1, the QUIC error
+code carries the error reason; a client DISCONNECT has no Reason Code and the
+broker MUST NOT send DISCONNECT. An unrecognized code alone establishes
+neither a network failure nor which endpoint is at fault.
+
+**Client reconnection policy:** The following rules apply only to the client
+and to broker-originated reports, not to reset responses echoing a client's
+own error report:
+
+- On a broker-originated Session Taken Over reason (`0x8E` in MQTT 5.0 or
+  `0x38E` in a QUIC application error), the client MUST apply the backoff from
+  Section 6.6.4 before attempting to reconnect.
+- For other recognized mapped reasons, the client SHOULD follow the applicable
+  MQTT reason semantics. When no more specific recovery rule applies, the
+  client MAY retry with standard backoff.
 
 ## 6.4 Protocol Discovery
 
@@ -748,16 +723,18 @@ identically to both MQTT 5.0 and MQTT 3.1.1.
    The session outcome on the winning transport depends on the `Clean Session`
    / `Clean Start` flag in the winning `MQTT.CONNECT`:
 
-   - **Clean Session/Clean Start = 0**: The existing session state is retained
-     and **transfers** to the winning transport. The losing transport's session
-     is discarded.
+   - **Clean Session/Clean Start = 0**: Any existing Session State that remains
+     available under the negotiated protocol's lifetime rules is retained and
+     resumed on the winning transport. The losing transport is detached from
+     that Session; its closure does not itself reset persistent Session State.
+     If no Session State remains, the broker starts a new Session.
    - **Clean Session/Clean Start = 1**: The broker **MUST discard any existing
-     session state** [MQTT5] §3.1.2.3, [MQTT311] §3.1.2.6.2 and create a new
+     session state** [MQTT5] §3.1.2.4, [MQTT311] §3.1.2.4 and create a new
      session. There is no session to transfer — the winning transport starts
      fresh.
 
-   In both cases, the losing transport's connection is closed and the session
-   no longer exists on that transport.
+   In both cases, the losing transport's Network Connection is closed. Closing
+   that connection and deleting stored Session State are separate operations.
 
 3. The broker MUST send `MQTT.CONNACK` to the **winning** transport with the
    `Session Present` flag set according to the negotiated protocol. The flag
@@ -864,14 +841,15 @@ unintended session takeovers where the client's TCP/TLS reconnection could
 displace an existing MQTT session over QUIC that the broker is still maintaining.
 
 For Session Expiry Interval = 0 (MQTT 5.0) or Clean Session = 1 (MQTT 3.1.1),
-the session is discarded when the Network Connection closes [MQTT5] §4.1.0-2,
-[MQTT311] §4.1.0-1. There is no session state to resume on reconnect.
+the session is discarded when the Network Connection closes [MQTT5] §3.1.2.11.2,
+[MQTT311] §3.1.2.4. There is no session state to resume on reconnect.
 
 For MQTT 3.1.1, the CONNACK has no Session Expiry Interval. The client MUST
 infer session persistence from the `Clean Session` flag it sent in CONNECT:
 if `Clean Session` was 0, the broker retains the session across network
-failures [MQTT311] §3.1.1; the client SHOULD prefer reconnecting on QUIC
-before attempting TCP/TLS to avoid unintended session takeovers.
+failures [MQTT311] §3.1.2.4, subject to the deletion conditions in Section 6.7.3;
+the client SHOULD prefer reconnecting on QUIC before attempting TCP/TLS to avoid
+unintended session takeovers.
 
 ### 6.6.4 Preventing Reconnection Livelock
 
@@ -927,8 +905,21 @@ To ensure robust communication and consistent state management, it is critical t
 
 ### 6.7.1 Mapping QUIC Transport Errors to MQTT Session State
 
-The MQTT Session persists across a sequence of Network Connections [MQTT5] §4.1. A failure at the QUIC layer breaks the Network Connection but does not automatically terminate the MQTT Session.
-The Session continues until any of the following occurs: the Session Expiry Interval elapses (MQTT 5.0), the client sends a CONNECT with Clean Session=1 (MQTT 3.1.1), the client or server sends an `MQTT.DISCONNECT` with Session Expiry Interval set to 0 (MQTT 5.0), or the broker explicitly terminates the session (e.g., during session takeover per Section 6.5.2).
+An MQTT Session can persist across a sequence of Network Connections. Session
+State retention is governed by the negotiated MQTT version's lifetime rules,
+not by which endpoint closes the transport:
+
+- MQTT 5.0: Apply the Clean Start and Session Expiry Interval rules [MQTT5]
+  §3.1.2.4, §3.1.2.11.2, and §4.1.
+- MQTT 3.1.1: Apply the Clean Session rules [MQTT311] §3.1.2.4 and the explicit
+  deletion conditions in Section 6.7.3. With `Clean Session`=0, closing the
+  MQTT stream or the entire QUIC connection does not itself delete stored
+  Session State. With `Clean Session`=1, the Session ends when its MQTT Network
+  Connection closes, even if the QUIC connection remains open.
+
+Session takeover closes the losing Network Connection; resuming or resetting
+Session State depends on the winning CONNECT and the applicable lifetime rules
+(Section 6.5.2). Takeover alone is not a request to delete persistent state.
 
 ### 6.7.1.1 Abnormal Transport Shutdown
 
@@ -942,103 +933,205 @@ An “Abnormal Shutdown” (as defined in Section 6.3.2) occurs when the QUIC co
 
 Mapping Logic:
 
-- Session Persistence: When a QUIC-level error triggers an abnormal shutdown, the MQTT session MUST NOT be immediately terminated. The session state remains active on the broker according to the established Session Expiry Interval (MQTT 5.0), until the client sends a CONNECT with `Clean Session` set to 1 (MQTT 3.1.1 [MQTT311] §3.1.3), or until the client or server sends an `MQTT.DISCONNECT` with Session Expiry Interval set to 0 (MQTT 5.0).
+- Session Persistence: An abnormal transport shutdown ends the MQTT Network
+  Connection. The broker MUST apply the version-specific Session State
+  retention rules in Section 6.7.1. In particular, a transport failure is not
+  itself a deletion condition for a persistent MQTT 3.1.1 Session; the
+  conditions in Section 6.7.3 still apply.
 
 - State Synchronization: The application layer distinguishes a network-level QUIC failure from a protocol violation by the absence of an MQTT.DISCONNECT packet. 
   If the QUIC connection is lost, the client may attempt to reconnect and resume the session using the same Client Identifier.
 
 ### 6.7.2 Mapping MQTT Protocol Errors to QUIC Transport State
 
-Errors detected at the MQTT application layer may require the immediate termination of the underlying QUIC transport to prevent the processing of malformed or unauthorized data.
+On detecting a Malformed Packet or Protocol Error, either endpoint MUST
+immediately stop processing incoming MQTT packets on the affected stream and
+initiate termination of that MQTT Network Connection. It MUST NOT wait for
+peer FIN or a peer MQTT response before doing so. In this section, "the
+detecting endpoint" means either the client or the broker that detected the
+error in its peer's MQTT traffic.
+
+Mandatory client termination is a requirement of this profile. For MQTT 5.0,
+[MQTT5] §4.13.1 specifies SHOULD close for the client and MUST close for the
+server; this profile requires closure by either endpoint. MQTT 3.1.1 requires
+either endpoint to close on a protocol violation unless stated otherwise
+[MQTT311] §4.8. Notification rules remain version- and role-specific below.
+The normal error path terminates the MQTT stream, not the entire QUIC
+connection; transport completion and the bounded cleanup fallback are defined
+in Section 6.7.2.3.
 
 #### 6.7.2.1 Protocol Violations and Malformed Packets (MQTT 5.0)
 
-In accordance with MQTT 5.0 specifications, if the Server detects a Malformed Packet or Protocol Error:
+Use `0x81` (Malformed Packet) or `0x82` (Protocol Error) unless [MQTT5]
+specifies a more specific Reason Code permitted for the notifying endpoint's
+role and packet type. Either endpoint MUST terminate the MQTT Network
+Connection regardless of whether a notification is sent.
 
-Notification: The server SHOULD send an `MQTT.DISCONNECT` packet containing the appropriate Reason Code (e.g., `0x81` for Malformed Packet or `0x82` for Protocol Error).
-Transport Action: Immediately following the transmission of the `MQTT.DISCONNECT` (or if the error occurs during the CONNECT phase), the server MUST half-close its send direction on the stream. The stream is fully closed when both directions are half-closed. The QUIC connection remains open so the client can reconnect.
+**Server notification:** After sending a successful `MQTT.CONNACK`, the server
+SHOULD send `MQTT.DISCONNECT` with the appropriate Reason Code before
+terminating the MQTT Network Connection.
+
+Before sending a successful `MQTT.CONNACK`, the server MUST NOT send
+`MQTT.DISCONNECT` [MQTT5] §3.14. For an error in a CONNECT packet, the server MAY
+send a CONNACK containing the appropriate failure Reason Code before closing
+the MQTT Network Connection [MQTT5] §4.13.1.
+
+**Client notification:** The client SHOULD send `MQTT.DISCONNECT` with the
+appropriate Reason Code before terminating the MQTT Network Connection. For
+an error in an AUTH packet, it MAY send that notification [MQTT5] §4.13.1;
+more specific requirements, including failed re-authentication in [MQTT5]
+§4.12.1, still apply. The server's successful-CONNACK prerequisite does not
+apply to the client, but CONNECT MUST remain the client's first MQTT packet
+[MQTT5] §3.1.
+
+Where DISCONNECT is recommended above, either endpoint MAY omit it when
+transport failure or persistent flow-control blockage prevents prompt
+transmission. Omission MUST NOT delay initiation of shutdown or the cleanup
+deadline in Section 6.7.2.3.
+
+**Transport action (either detecting endpoint):**
+
+1. **Send direction (detecting endpoint to peer):** On the normal error path,
+   the detecting endpoint MUST finish its sending direction with FIN after
+   `MQTT.DISCONNECT` or the server's failure `MQTT.CONNACK`, if sent. If neither
+   packet is sent, it MUST still finish its sending direction with FIN. It
+   MUST NOT initiate a `RESET_STREAM` merely because the peer caused the MQTT
+   error, as that could interrupt delivery of those MQTT packets.
+2. **Receive direction (peer to detecting endpoint):** The detecting endpoint
+   MUST abort MQTT reads. It MUST send `STOP_SENDING` if its receiving
+   direction has neither received all stream data nor been reset [RFC9000]
+   §3.5. Use `0x381` for Malformed Packet or `0x382` for Protocol Error, or the
+   Section 6.3.3 mapping of a more specific MQTT Reason Code applicable to its
+   role.
+
+The two directional actions are independent. Receive-side shutdown MUST NOT
+wait for delivery of `MQTT.DISCONNECT` or a failure `MQTT.CONNACK`. Interpret
+reset responses according to Section 6.3.3; completion and cleanup follow
+Section 6.7.2.3.
 
 #### 6.7.2.2 Protocol Violations and Malformed Packets (MQTT 3.1.1)
 
-For MQTT 3.1.1, the broker MUST NOT send `MQTT.DISCONNECT` (it is a client-to-server-only packet [MQTT311] §3.14). Upon detecting a Malformed Packet or Protocol Error:
+**Notification:** MQTT 3.1.1 has no reason-coded DISCONNECT. The broker MUST
+NOT send `MQTT.DISCONNECT` (it is a client-to-server-only packet [MQTT311]
+§3.14) and MUST NOT add an MQTT error-notification packet. A client is not
+required to send `MQTT.DISCONNECT` on this error path. If it sends the ordinary
+MQTT 3.1.1 DISCONNECT, that packet does not carry the error reason and retains
+its normal effect on Will handling [MQTT311] §3.14.4. An MQTT 3.1.1 DISCONNECT
+MUST NOT include MQTT 5.0 Reason Codes or properties.
 
-Notification: The broker MUST NOT send any MQTT packet to the client.
-Transport Action: The broker MUST send a `STOP_SENDING` frame with error code `0x381` (Malformed Packet) or `0x382` (Protocol Error) to the client. This tells the client "I will not read your data, the error is yours." The QUIC connection remains open so the client can reconnect.
+**Transport action (either detecting endpoint):** On the normal error path,
+the detecting endpoint MUST apply the FIN/send and `STOP_SENDING`/receive
+actions in Section 6.7.2.1, with MQTT packets limited to those permitted above.
+FIN follows the client's `MQTT.DISCONNECT` if sent; a broker sends FIN without
+an MQTT packet. Use `0x381` for Malformed Packet or `0x382` for Protocol Error.
+The reset interpretation and cleanup requirements in Sections 6.3.3 and
+6.7.2.3 apply to either endpoint.
+
+#### 6.7.2.3 Error-Stream Completion and Cleanup
+
+The detecting endpoint MUST NOT process subsequent incoming stream data as
+MQTT packets on that Network Connection. Stream completion, transport-state
+retention, and retransmission follow [RFC9000] §§3, 4.4, and 13.3.
+
+The QUIC connection remains open after successful stream cleanup. A new MQTT
+stream MUST NOT become active until the previous stream is fully closed under
+[RFC9000] §3.4, consistent with the single-active-stream rule in Section 5.2.
+
+The FIN requirement is subject to QUIC stream-state and connection-termination
+rules [RFC9000] §§3 and 10.
+
+**Bounded cleanup:** Either detecting endpoint MUST enforce a finite, positive,
+configurable protocol-error cleanup timeout starting when it detects the error.
+If the stream is not fully closed at the deadline and the QUIC connection is 
+still open, the endpoint MUST initiate an immediate QUIC connection close under 
+[RFC9000]
+
+§10.2. Use an application `CONNECTION_CLOSE` with the original MQTT error
+mapped by Section 6.3.3, subject to the handshake rules in [RFC9000] §10.2.3.
+This is an exception to keeping the QUIC connection open. The endpoint MUST
+NOT wait for peer FIN, peer reset, or acknowledgement of `MQTT.DISCONNECT` or
+a failure `MQTT.CONNACK` before invoking this fallback.
+
+The deadline applies even when sending is blocked; delivery of `MQTT.DISCONNECT`
+or a failure `MQTT.CONNACK` is not guaranteed. Closing the stream or connection
+does not itself delete persistent MQTT Session State; apply Sections 6.7.1
+and 6.7.3.
 
 ### 6.7.3 Error Mapping Matrix
 
-The following table summarizes the mapping between the layers. The "MQTT Session Impact" column shows the behavior for MQTT 5.0; MQTT 3.1.1 behavior is noted below the table. In Single Stream mode, the broker uses normal stream half-close for graceful shutdown, `STOP_SENDING` for peer's error, or `RESET_STREAM` for local error — it does not close the entire QUIC connection.
+The following table summarizes the mapping between the layers. The "MQTT
+Session Impact" column shows the behavior for MQTT 5.0; MQTT 3.1.1 behavior is
+noted below the table. Graceful shutdown follows Section 6.3.1; protocol-error
+shutdown follows Section 6.7.2 for either detecting endpoint.
 
 | EVENT SOURCE |       ERROR TYPE        |  ACTION/MAPPING   |        MQTT SESSION IMPACT        |  QUIC STREAM IMPACT   |
 |:-------------|:-----------------------:|:-----------------:|:---------------------------------:|:---------------------:|
 | QUIC Layer   | Stream Reset / Timeout  | Abnormal Shutdown |  Session persists (until Expiry)  | `RESET_STREAM` + code |
 | QUIC Layer   |     Connection Loss     | Abnormal Shutdown |  Session persists (until Expiry)  | Connection Terminated |
-| MQTT Layer   | Malformed Packet (0x81) |  Protocol Error   |  Session persists (per Expiry)    | MQTT 5.0: DISCONNECT + normal close / MQTT 3.1.1: `STOP_SENDING` 0x381 |
-| MQTT Layer   |  Protocol Error (0x82)  |  Protocol Error   |  Session persists (per Expiry)    | MQTT 5.0: DISCONNECT + normal close / MQTT 3.1.1: `STOP_SENDING` 0x382 |
+| MQTT Layer   | Malformed Packet (0x81) |  Protocol Error   |  Session persists (per Expiry)    | Both versions, either endpoint: send FIN + receive-side `STOP_SENDING` 0x381 where applicable; notification per §6.7.2.1/§6.7.2.2; completion/fallback per §6.7.2.3 |
+| MQTT Layer   |  Protocol Error (0x82)  |  Protocol Error   |  Session persists (per Expiry)    | Both versions, either endpoint: send FIN + receive-side `STOP_SENDING` 0x382 where applicable; notification per §6.7.2.1/§6.7.2.2; completion/fallback per §6.7.2.3 |
 | Application  |    Graceful Shutdown    |  MQTT.DISCONNECT  | Per Session Expiry Interval       | Normal stream half-close |
-| Application  | Session Takeover (0x8E) |  MQTT.DISCONNECT  | Session persists on winning transport | MQTT 5.0: normal close / MQTT 3.1.1: `RESET_STREAM` 0x38E |
+| Application  | Session Takeover (0x8E) |  MQTT.DISCONNECT  | Resume or reset per Section 6.5.2 | MQTT 5.0: normal close / MQTT 3.1.1: `RESET_STREAM` 0x38E |
 
-**MQTT 3.1.1 notes:** For MQTT 3.1.1, the session lifetime is controlled by the `Clean Session` flag in CONNECT [MQTT311] §3.1.2.4 rather than a Session Expiry Interval.
-When `Clean Session` is 0, the session persists indefinitely until the client sends a CONNECT with `Clean Session` set to 1 or the broker closes the connection.
-Therefore, the "Session persists (until Expiry)" rows above should be read as "Session persists until `Clean Session`=1 or broker closes connection" for MQTT 3.1.1.
-The Malformed Packet and Protocol Error rows use `STOP_SENDING` (not the connection) but the 3.1.1 session state is NOT terminated — it persists indefinitely if `Clean Session` was 0.
+**MQTT 3.1.1 notes:** MQTT 3.1.1 defines no Session Expiry Interval property.
+Session lifetime is controlled by `Clean Session` in CONNECT [MQTT311] §3.1.2.4.
+With `Clean Session`=0, the client and broker MUST retain Session State after
+the MQTT Network Connection closes. Distinguish the following deletion conditions:
+
+1. **Client-requested reset:** When the broker accepts a CONNECT with the same
+   Client Identifier and `Clean Session`=1, the client and broker MUST discard
+   the previous Session State and start a new Session [MQTT311] §3.1.2.4 and
+   §3.1.4. A rejected CONNECT does not itself require deletion of previously
+   stored Session State.
+2. **Non-persistent session ends:** Session State belonging to a
+   `Clean Session`=1 Session MUST be discarded when its MQTT Network Connection
+   closes [MQTT311] §3.1.2.4. This condition does not apply to a persistent
+   `Clean Session`=0 Session.
+3. **Administrative cleanup:** Offline persistent Session State may be removed
+   by explicit administrative action or a documented broker retention policy,
+   such as an offline retention limit or resource-limit eviction policy. These
+   are broker operational policies acknowledged by the non-normative guidance
+   in [MQTT311] §4.1. MQTT 3.1.1 defines no Session Expiry Interval property.
+
+For `Clean Session`=0, client `MQTT.DISCONNECT`, broker-initiated closure, QUIC
+stream reset or connection loss, connection timeouts, and takeover using
+`Clean Session`=0 do not themselves delete persistent Session State. This also
+applies to the Malformed Packet and Protocol Error rows above.
+
+For MQTT 3.1.1 with `Clean Session`=0, read the matrix's Session Expiry references
+as: "Session State survives Network Connection closure until an accepted CONNECT
+with the same Client Identifier and Clean Session=1 resets it, or it is removed
+by explicit administrative action or a documented broker retention policy."
+For `Clean Session`=1, apply condition 2 instead.
 
 ### 6.7.4 State Synchronization Summary
+
 To prevent “zombie” sessions or inconsistent states, the following rules apply:
 
-Transport-to-Application: QUIC-level errors trigger a transition to a “disconnected” state but maintain the “session” state until the expiry timer expires.
-Application-to-Transport: MQTT-level protocol errors trigger an immediate and mandatory teardown of the QUIC stream (via `STOP_SENDING` for peer's error or `RESET_STREAM` for local error, with the appropriate error code from Section 6.3.3) to ensure security and data integrity. The QUIC connection remains open so the client can reconnect.
+Transport-to-Application: QUIC-level errors transition the MQTT Network
+Connection to a disconnected state. Retain or discard Session State according
+to the MQTT 5.0 lifetime rules or the MQTT 3.1.1 conditions in Sections 6.7.1 and
+6.7.3.
+
+Application-to-Transport: A Malformed Packet or Protocol Error immediately
+stops incoming MQTT processing at the detecting endpoint and starts teardown
+under Section 6.7.2. That section defines the version- and role-specific MQTT
+packets, FIN/`STOP_SENDING` mapping, and bounded cleanup for either endpoint.
 
 
 ### 6.8 Keepalive Strategy
 
-The keepalive strategy leverages both QUIC's transport-level features and MQTT's application-level liveness mechanisms. 
-
-QUIC transport layer keepalive is encouraged to be used as primary Mechanism because in traditional TCP-based MQTT, a large payload 
-could block a PINGREQ from being sent, leading to false disconnections while this is mitigated in QUIC transport, QUIC PING frames are transport-level control frames 
-rather than application data, meaning they do not belong to any specific stream. They bypass stream-level flow control and ordering constraints.
-
-The strategy is defined as follows:
-
-**Transport-Layer Keepalive**
-
-- Primary Mechanism: 
-
-Connection keepalive SHOULD be handled natively by the underlying QUIC transport layer, with both the client and server maintaining their own keepalive traffic.
-
-- End-to-End Delivery:
-
-QUIC PING frames are encrypted and opaque to intermediaries — proxies, NAT
-gateways, and load balancers cannot inspect or modify their content. However,
-the UDP packets carrying these frames may still timeout in middleboxes.
-RFC 9000 §10.1.2 notes that middleboxes may expire UDP state earlier than the
-negotiated idle timeout, which is why periodic keepalive traffic is necessary.
-
-- Simplified Implementation: 
-
-Relying on QUIC for this traffic simplifies the timing implementation for both the MQTT client and server.
-
-**Application-Layer (MQTT) Keepalive**
-
-- MQTT PINGREQ/PINGRESP:
-
-The traditional MQTT keepalive mechanism using PINGREQ and PINGRESP control packets MAY still be supported for application-level liveness detection. 
-However, it MUST NOT be used as a substitute for QUIC-level keepalive. The MQTT Keep Alive interval (under which PINGREQ is sent) is typically much slower 
-than the frequency of UDP packets needed to keep middlebox state alive. Moreover, MQTT PINGREQ is sent on the MQTT bidirectional stream and can be head-of-line 
-blocked if the stream stalls. QUIC PING frames are connection-level and operate out-of-band from any specific stream, so they are not subject to stream-level 
-flow control or head-of-line blocking. QUIC PING frames provide the transport-layer keepalive that keeps the connection and middlebox state alive.
-
-- Timeout Coordination: 
-
-If QUIC connection keepalive is enabled, the QUIC connection's idle timeout SHOULD be configured to be strictly greater than the MQTT keepalive interval. 
-This prevents the QUIC connection from abruptly shutting down due to perceived idleness while the application is waiting to send an MQTT.PINGREQ packet.
+Apply the connection keepalive and MQTT timeout-coordination requirements in
+Section 6.2. A transport failure detected by keepalive is handled under
+Sections 6.3.2 and 6.6.
 
 ### 6.8.1 Connection Migration
 
-QUIC supports connection migration [RFC9000] §8: when a client changes its IP address or port (e.g., Wi-Fi to cellular), the QUIC connection remains intact. 
-During migration, in-flight MQTT packets already buffered on the stream are not lost. Connection migration is NOT an abnormal shutdown — the underlying QUIC 
-connection and the MQTT session continue without disruption. The `preferred_address` transport parameter [RFC9000] §4.6 is handled entirely by the QUIC 
-layer and does not affect the MQTT session.
+Connection migration follows [RFC9000] §9, including server preferred-address
+handling in §9.6. Successful migration preserves the MQTT Network Connection,
+its stream, and its Session; it does not require another `MQTT.CONNECT`.
+Transport failure during migration follows the normal failure handling in
+Sections 6.3.2 and 6.6.
 
 # 7 Security Considerations
 
@@ -1051,10 +1144,9 @@ wish to use client certificates for additional access control MAY enable mTLS
 at the TLS layer, but such a requirement must not be treated as a mandatory
 part of Single Stream mode conformance.
 
-**Mandatory encryption.** QUIC mandates TLS 1.3 for all connections [RFC9000].
-There is no unencrypted QUIC option. All MQTT traffic in Single Stream mode is
-therefore encrypted in transit. Implementations MUST NOT downgrade to plain-text
-TCP when the QUIC connection fails.
+**Mandatory encryption.** QUIC transport protection follows [RFC9001].
+Implementations MUST NOT downgrade to plain-text TCP when the QUIC connection
+fails; TCP/TLS fallback follows Section 6.6.
 
 **0-RTT replay risk.** When 0-RTT connection resumption is used, early data
 sent by the client before the server responds may be replayed by an attacker.
@@ -1120,6 +1212,10 @@ A conformant MQTT client implementing Single Stream mode:
 7. If the client supports TCP/TLS fallback, it MUST follow the fallback
    procedure in Section 6.6 when the QUIC handshake fails or times out.
 8. MUST NOT downgrade to a plain-text TCP connection under any circumstances.
+9. Upon detecting a Malformed Packet or Protocol Error, MUST stop incoming
+   MQTT processing and follow Sections 6.3.3 and 6.7.2, including their
+   error-code interpretation, directional shutdown, and bounded cleanup
+   requirements.
 
 ## 8.3 MQTT Broker Conformance
 
@@ -1131,7 +1227,10 @@ A conformant MQTT broker implementing Single Stream mode:
 3. MUST NOT initiate QUIC streams; the broker only accepts the stream opened by
    the client.
 4. MUST process all MQTT packets received over the stream in the order they
-   arrive.
+   arrive until an error requires termination. Upon detecting a Malformed
+   Packet or Protocol Error, MUST stop incoming MQTT processing and follow
+   Sections 6.3.3 and 6.7.2, including their error-code interpretation,
+   directional shutdown, and bounded cleanup requirements.
 5. For MQTT 5.0, MUST follow the server-initiated graceful shutdown procedure
    defined in Section 6.3.1 when disconnecting cleanly. For MQTT 3.1.1, the
    broker MUST NOT send `MQTT.DISCONNECT` (it is a client-to-server-only
