@@ -275,10 +275,11 @@ transport layer without modifying any MQTT packet handling logic.
 
 ## 5.2 Stream Establishment
 
-After the QUIC connection handshake is complete, the client MUST open exactly
-one bidirectional (BIDI) QUIC stream. This stream carries all MQTT packets for
-the lifetime of the connection. The server MUST NOT initiate a stream in Single
-Stream mode.
+After the QUIC connection handshake is complete, the client MUST open one
+bidirectional (BIDI) QUIC stream for each MQTT Network Connection. The client
+MUST NOT have more than one MQTT stream active on the QUIC connection at any
+time. Each stream carries all MQTT packets for the lifetime of its MQTT Network
+Connection. The server MUST NOT initiate a stream in Single Stream mode.
 
 The ALPN identifier negotiated during the QUIC handshake for Single Stream mode
 is `mqtt`.
@@ -289,7 +290,7 @@ All MQTT control packets — including `MQTT.CONNECT`, `MQTT.CONNACK`,
 `MQTT.PUBLISH`, `MQTT.SUBSCRIBE`, `MQTT.PINGREQ`, `MQTT.DISCONNECT`, and all
 associated acknowledgement packets — MUST be transmitted over the single
 bidirectional stream in the order they are produced. No changes are made to the
-MQTT packet binary format. This mode is fully compatible with MQTT 3.1
+MQTT packet binary format. This mode is fully compatible with MQTT 3.1.1
 [MQTT311] and MQTT 5.0 [MQTT5].
 
 QUIC delivers data as an ordered byte stream and does not preserve packet
@@ -390,9 +391,23 @@ If the server selects an identifier that the client did not offer, the client
 MUST treat this as a connection error of type 0x0178
 (`no_application_protocol`) and close the connection [RFC9001] §8.1.
 
-The ALPN negotiation MUST be completed before any MQTT packets are exchanged.
-A server that has not negotiated the `mqtt` ALPN identifier MUST NOT accept
-MQTT packets over the connection.
+Except for 0-RTT early data permitted by this section, ALPN negotiation MUST be
+completed before any MQTT packets are exchanged.
+
+A client MAY send MQTT packets as 0-RTT early data only when resuming a TLS
+session whose pre-shared key (PSK) is associated with the `mqtt` ALPN
+identifier. The client MUST include `mqtt` in the ALPN protocol list of the new
+ClientHello.
+
+The server MUST NOT accept or process 0-RTT MQTT data unless it accepts early
+data and selects the `mqtt` ALPN identifier associated with the resumed PSK, as
+required by [RFC8446] §4.2.10. If the server rejects the early data, the client
+MUST treat the early MQTT packets as unprocessed and send them again only after
+`mqtt` has been negotiated. MQTT packets sent as 0-RTT early data MUST also
+satisfy the replay-safety requirements in Section 7.
+
+A server that has neither negotiated `mqtt` nor accepted 0-RTT under the rules
+above MUST NOT accept MQTT packets over the connection.
 
 ---
 
@@ -401,12 +416,13 @@ MQTT packets over the connection.
 ## 6.1 Establishing a Connection
 
 A QUIC connection MUST be established between the client and the server as
-described in [RFC9000] before any MQTT packets are exchanged. The client
-initiates the QUIC connection.
+described in [RFC9000] before any MQTT packets are exchanged, except for 0-RTT
+early data sent under the conditions in Section 5.5.3. The client initiates the
+QUIC connection.
 
 Support for 0-RTT connection resumption is OPTIONAL. Implementations that
-support 0-RTT SHOULD be aware of replay risks when sending early data; see
-Section 7 for security considerations.
+support 0-RTT MUST follow the ALPN-binding and rejection requirements in
+Section 5.5.3 and the replay-safety requirements in Section 7.
 
 If the client does not receive a `MQTT.CONNACK` packet from the server within
 a reasonable amount of time, the client SHOULD close the Network Connection
@@ -1042,11 +1058,18 @@ TCP when the QUIC connection fails.
 
 **0-RTT replay risk.** When 0-RTT connection resumption is used, early data
 sent by the client before the server responds may be replayed by an attacker.
+The early data is encrypted using keys derived from the resumed TLS PSK, but it
+does not have the replay protection of data sent after the handshake completes
+[RFC8446] §8. Implementations that support 0-RTT MUST follow the ALPN-binding
+and rejection requirements in Section 5.5.3.
+
 Implementations that support 0-RTT MUST ensure that any MQTT packets sent as
 early data are safe to replay, i.e., are idempotent or are protected by a
 server-verified session token. An `MQTT.CONNECT` packet sent in 0-RTT mode
 SHOULD be treated with caution by the server until session state can be
-verified.
+verified. If the server rejects early data, the client MUST treat every MQTT
+packet sent in that early data as unprocessed and send it again only after
+`mqtt` has been negotiated.
 
 When 0-RTT is used during an upgrade from TCP/TLS to QUIC, the replay risk is
 amplified: an attacker who observes the client's upgrade attempt could replay
@@ -1087,12 +1110,13 @@ A conformant MQTT client implementing Single Stream mode:
 
 1. MUST establish a QUIC connection to the broker as specified in [RFC9000].
 2. MUST negotiate the ALPN identifier `mqtt` during the QUIC handshake.
-3. MUST open exactly one bidirectional QUIC stream after the handshake and use
-   it to carry all MQTT packets.
+3. MUST open one bidirectional QUIC stream for each MQTT Network Connection and
+   use it to carry all MQTT packets for that Network Connection.
 4. MUST NOT modify the binary format of any MQTT packet.
 5. MUST follow the client-initiated graceful shutdown procedure defined in
    Section 6.3.1 when disconnecting cleanly.
-6. MUST NOT open additional streams in Single Stream mode.
+6. MUST NOT have more than one MQTT stream active on a QUIC connection at any
+   time in Single Stream mode.
 7. If the client supports TCP/TLS fallback, it MUST follow the fallback
    procedure in Section 6.6 when the QUIC handshake fails or times out.
 8. MUST NOT downgrade to a plain-text TCP connection under any circumstances.
