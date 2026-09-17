@@ -1224,7 +1224,7 @@ packets, `RESET_STREAM`/`STOP_SENDING` mapping, and bounded cleanup for either
 endpoint.
 
 
-### 6.8 Keepalive Strategy
+## 6.8 Keepalive Strategy
 
 Apply the connection keepalive and MQTT timeout-coordination requirements in
 Section 6.2. A transport failure detected by keepalive is handled under
